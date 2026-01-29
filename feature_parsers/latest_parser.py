@@ -260,6 +260,33 @@ class ZephyrOptimizedParser:
 
         return table_lines
 
+    @staticmethod
+    def _format_table_for_bdd(datatable) -> List[str]:
+        """
+        Format a data table for BDD scripts without extra separator rows.
+        """
+        if not datatable or not datatable.rows:
+            return []
+
+        table_lines: List[str] = []
+        for row in datatable.rows:
+            table_lines.append("| " + " | ".join(str(cell.value or "") for cell in row.cells) + " |")
+        return table_lines
+
+    @staticmethod
+    def format_step_for_bdd(step: Step, indent: str = "    ") -> List[str]:
+        """
+        Format a step as Gherkin text for BDD script exports.
+        """
+        lines = [f"{indent}{step.keyword} {step.name}".rstrip()]
+        if step.datatable:
+            lines.extend([f"{indent}{row}" for row in ZephyrOptimizedParser._format_table_for_bdd(step.datatable)])
+        if step.docstring:
+            lines.append(f'{indent}"""')
+            lines.extend(textwrap.indent(step.docstring, indent).splitlines())
+            lines.append(f'{indent}"""')
+        return lines
+
     # ------------------------------------------------------------------
     #  Background processing for Zephyr
     # ------------------------------------------------------------------
@@ -640,12 +667,13 @@ class ZephyrOptimizedParser:
         bg_val_set: Set[str],
         steps: List[Step],
         tags: List[str],
+        config: ZephyrParserConfig,
     ) -> ZephyrTestCase:
         """
         Build a ``ZephyrTestCase`` from a scenario or scenario outline instance.
         Handles the conversion of steps, tag parsing, and objective generation.
         """
-        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set, self.config)
+        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set, config)
         fr_id, ccd, ncd, labels = ZephyrOptimizedParser.parse_tags(tags)
         objective = ZephyrOptimizedParser.generate_objective(name, tags)
 
@@ -661,7 +689,7 @@ class ZephyrOptimizedParser:
         )
 
     def _convert_scenario(self, sc: ScenarioTemplate, bg_precondition: str, bg_val_set: Set[str]) -> ZephyrTestCase:
-        return self._build_zephyr_case(sc.name, bg_precondition, bg_val_set, sc.steps, sc.tags)
+        return self._build_zephyr_case(sc.name, bg_precondition, bg_val_set, sc.steps, sc.tags, self.config)
 
     def _convert_outline(self, tpl: ScenarioTemplate, bg_precondition: str, bg_val_set: Set[str]) -> List[ZephyrTestCase]:
         cases: List[ZephyrTestCase] = []
@@ -675,7 +703,7 @@ class ZephyrOptimizedParser:
                 )
                 full_name = f"{rendered.name}-{identifier}" if identifier else rendered.name
                 cases.append(
-                    self._build_zephyr_case(full_name, bg_precondition, bg_val_set, rendered.steps, tpl.tags)
+                    self._build_zephyr_case(full_name, bg_precondition, bg_val_set, rendered.steps, tpl.tags, self.config)
                 )
         return cases
 
@@ -706,6 +734,56 @@ class ZephyrOptimizedParser:
             else:
                 cases.append(self._convert_scenario(sc_tpl, bg_precondition, bg_val_set))
         return cases
+
+    def build_bdd_scripts_from_feature(self) -> List[Tuple[str, str]]:
+        """
+        Build per-scenario BDD scripts for Zephyr's "Test Script (BDD)" import.
+        Returns a list of (case_name, bdd_script) tuples.
+        """
+        feature = self.parse()
+        feature_name = getattr(feature, "name", "Feature")
+
+        bg_lines: List[str] = []
+        if feature.background and feature.background.steps:
+            bg_lines.append("  Background:")
+            for step in feature.background.steps:
+                bg_lines.extend(self.format_step_for_bdd(step))
+
+        scripts: List[Tuple[str, str]] = []
+        for _, sc_tpl in feature.scenarios.items():
+            if sc_tpl.examples:
+                for ex_block in sc_tpl.examples:
+                    for ctx in ex_block.as_contexts():
+                        rendered = sc_tpl.render(ctx)
+                        identifier = (
+                            ctx.get("case identifier")
+                            or ctx.get("case_identifier")
+                            or ctx.get("case_name_identifier")
+                        )
+                        full_name = f"{rendered.name}-{identifier}" if identifier else rendered.name
+                        scripts.append((full_name, self._render_bdd_script(
+                            feature_name,
+                            rendered,
+                            bg_lines,
+                        )))
+            else:
+                scripts.append((sc_tpl.name, self._render_bdd_script(
+                    feature_name,
+                    sc_tpl,
+                    bg_lines,
+                )))
+        return scripts
+
+    def _render_bdd_script(self, feature_name: str, scenario: ScenarioTemplate, bg_lines: List[str]) -> str:
+        lines: List[str] = [f"Feature: {feature_name}", ""]
+        if scenario.tags:
+            lines.append(" ".join(scenario.tags))
+        lines.append(f"  Scenario: {scenario.name}")
+        if bg_lines:
+            lines.extend(bg_lines)
+        for step in scenario.steps:
+            lines.extend(self.format_step_for_bdd(step))
+        return "\n".join(lines).rstrip()
 
     # ------------------------------------------------------------------
     #  CSV Export for Zephyr (RECOMMENDED FORMAT)
@@ -778,6 +856,25 @@ class ZephyrOptimizedParser:
                             'Priority': '',
                             'Labels': ''
                         })
+
+    @staticmethod
+    def write_testcases_to_zephyr_bdd_csv(scripts: List[Tuple[str, str]], outfile: str):
+        """
+        Export BDD scripts for Zephyr's "BDD - Gherkin Script" import format.
+        """
+        with open(outfile, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = [
+                "Name",
+                "Test Script (BDD)",
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for name, script in scripts:
+                writer.writerow({
+                    "Name": name,
+                    "Test Script (BDD)": script,
+                })
 
     # ------------------------------------------------------------------
     #  Excel Export (Alternative format, but CSV is preferred)
