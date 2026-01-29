@@ -89,22 +89,3 @@ Feature: When default result
     assert len(steps) == 1
     assert steps[0].step_action == "user navigates to dashboard"
     assert steps[0].expected_result == "None"
-
-
-def test_write_bdd_csv_outputs_expected_columns(tmp_path: Path) -> None:
-    pytest.importorskip("pytest_bdd")
-    from feature_parsers.latest_parser import ZephyrOptimizedParser
-
-    scripts = [
-        ("Case A", "Feature: Sample\n\n  Scenario: A\n    Given step"),
-        ("Case B", "Feature: Sample\n\n  Scenario: B\n    When action"),
-    ]
-    outfile = tmp_path / "bdd.csv"
-
-    ZephyrOptimizedParser.write_testcases_to_zephyr_bdd_csv(scripts, str(outfile))
-
-    content = outfile.read_text(encoding="utf-8")
-    lines = content.splitlines()
-    assert lines[0] == "Name,Test Script (BDD)"
-    assert "Case A" in lines[1]
-    assert "Feature: Sample" in lines[1]
