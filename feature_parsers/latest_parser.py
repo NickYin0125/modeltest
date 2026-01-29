@@ -67,6 +67,14 @@ class ZephyrTestCase:
     labels: str = ""                           # Test labels/categories
 
 
+@dataclass
+class ZephyrParserConfig:
+    """Configuration options for parsing and expected-result defaults."""
+    given_expected_result: str = "None"
+    given_inherit_then_results: bool = True
+    when_default_expected_result: str = "auto"
+
+
 # -----------------------------------------------------------------------------
 # Main parser class optimized for Zephyr
 # -----------------------------------------------------------------------------
@@ -83,9 +91,10 @@ class ZephyrOptimizedParser:
     docstring.
     """
 
-    def __init__(self, feature_dir: Path, feature_file: str):
+    def __init__(self, feature_dir: Path, feature_file: str, config: Optional[ZephyrParserConfig] = None):
         self.feature_dir = feature_dir
         self.feature_file = feature_file
+        self.config = config or ZephyrParserConfig()
         self.feature = FeatureParser(self.feature_dir, self.feature_file)
 
     # ------------------------------------------------------------------
@@ -148,10 +157,9 @@ class ZephyrOptimizedParser:
            minimums and maximums.
         2. All rows are padded so that separators align consistently
            throughout the table.
-        3. A special header separator line uses a ``#-------#`` style
-           delimiter between the header and the rest of the rows instead of
-           the standard ``|`` separator.  This addresses the user's
-           requirement to visually distinguish the header.
+        3. A special header separator line uses standard pipe (``|``)
+           delimiters with dash fillers to keep the table readable in
+           Excel/Zephyr imports while still visually separating the header.
         4. Data rows continue to use the conventional pipe (``|``) delimiters
            with consistent spacing around cell contents.
         """
@@ -245,14 +253,39 @@ class ZephyrOptimizedParser:
 
             # Insert a header separator after the first row when there are more rows
             if row_idx == 0 and len(table_data) > 1:
-                # Build a '#-------#' style separator: a hash, then dashes sized to each column,
-                # separated by hash characters, and ending with a trailing hash.  No spaces are
-                # included to emphasise the header split.
+                # Build a pipe-based separator row so Excel/Zephyr render it cleanly.
                 dash_segments = ["-" * len(formatted_cells[col_idx]) for col_idx in range(len(formatted_cells))]
-                header_sep = "#" + "#".join(dash_segments) + "#"
+                header_sep = "| " + " | ".join(dash_segments) + " |"
                 table_lines.append(header_sep)
 
         return table_lines
+
+    @staticmethod
+    def _format_table_for_bdd(datatable) -> List[str]:
+        """
+        Format a data table for BDD scripts without extra separator rows.
+        """
+        if not datatable or not datatable.rows:
+            return []
+
+        table_lines: List[str] = []
+        for row in datatable.rows:
+            table_lines.append("| " + " | ".join(str(cell.value or "") for cell in row.cells) + " |")
+        return table_lines
+
+    @staticmethod
+    def format_step_for_bdd(step: Step, indent: str = "    ") -> List[str]:
+        """
+        Format a step as Gherkin text for BDD script exports.
+        """
+        lines = [f"{indent}{step.keyword} {step.name}".rstrip()]
+        if step.datatable:
+            lines.extend([f"{indent}{row}" for row in ZephyrOptimizedParser._format_table_for_bdd(step.datatable)])
+        if step.docstring:
+            lines.append(f'{indent}"""')
+            lines.extend(textwrap.indent(step.docstring, indent).splitlines())
+            lines.append(f'{indent}"""')
+        return lines
 
     # ------------------------------------------------------------------
     #  Background processing for Zephyr
@@ -281,15 +314,16 @@ class ZephyrOptimizedParser:
     def collect_zephyr_steps(
         steps: List[Step],
         bg_values: Set[str],
+        config: ZephyrParserConfig,
     ) -> List[ZephyrTestStep]:
         """
         Convert Gherkin steps to Zephyr test steps format.  This method
         traverses the list of steps and produces a corresponding sequence of
         ``ZephyrTestStep`` objects.  Given steps that are not part of the
-        background will have an expected result of ``"None"``, while When/Then
-        combinations are processed to pair actions with results.  Orphaned
-        Then steps (those not preceded by a When) are grouped into a single
-        validation step.
+        background default to ``config.given_expected_result`` and can inherit
+        immediate Then results when configured. When/Then combinations are
+        processed to pair actions with results, and orphaned Then steps (those
+        not preceded by a When) are grouped into a single validation step.
         """
         zephyr_steps: List[ZephyrTestStep] = []
         step_number = 0
@@ -297,19 +331,37 @@ class ZephyrOptimizedParser:
         accumulated_then_results: List[str] = []  # Collect multiple Then statements
         orphaned_then_results: List[str] = []  # Then steps without preceding When steps
 
-        for i, step in enumerate(steps):
+        effective_types: List[str] = []
+        last_primary_type = "given"
+        for step in steps:
+            stype = step.type.lower()
+            if stype in {"and", "but"}:
+                effective_types.append(last_primary_type)
+            elif stype in {"given", "when", "then"}:
+                last_primary_type = stype
+                effective_types.append(stype)
+            else:
+                effective_types.append(stype)
+
+        i = 0
+        while i < len(steps):
+            step = steps[i]
             txt = ZephyrOptimizedParser.format_step(step)
             clean_txt = ZephyrOptimizedParser.format_step_for_zephyr(step)
-            stype = step.type.lower()
-            next_step_type = steps[i + 1].type.lower() if i + 1 < len(steps) else None
+            stype = effective_types[i]
+            next_step_type = effective_types[i + 1] if i + 1 < len(steps) else None
 
             if stype == "given":
                 if txt in bg_values:
+                    i += 1
                     continue  # Skip background steps
 
                 # Finalize any pending When steps before processing Given
                 ZephyrOptimizedParser._finalize_pending_when_steps(
-                    pending_when_steps, accumulated_then_results, zephyr_steps
+                    pending_when_steps,
+                    accumulated_then_results,
+                    zephyr_steps,
+                    config,
                 )
                 pending_when_steps.clear()
                 accumulated_then_results.clear()
@@ -325,12 +377,25 @@ class ZephyrOptimizedParser:
                     zephyr_steps.append(validation_step)
                     orphaned_then_results.clear()
 
+                expected_result = config.given_expected_result
+                if config.given_inherit_then_results and next_step_type == "then":
+                    then_results: List[str] = []
+                    j = i + 1
+                    while j < len(steps) and effective_types[j] == "then":
+                        then_results.append(ZephyrOptimizedParser.format_step_for_zephyr(steps[j]))
+                        j += 1
+                    expected_result = (
+                        ZephyrOptimizedParser._format_separated_verification(then_results)
+                        if then_results
+                        else config.given_expected_result
+                    )
+                    i = j - 1
+
                 step_number += 1
-                # For Given steps in a scenario, the expected result is simply 'None'
                 zephyr_steps.append(ZephyrTestStep(
                     step_number=step_number,
                     step_action=clean_txt,
-                    expected_result="None"
+                    expected_result=expected_result
                 ))
 
             elif stype == "when":
@@ -356,7 +421,10 @@ class ZephyrOptimizedParser:
 
                 # If next step is not Then and not another When, finalize with default result
                 if next_step_type not in ["then", "when"]:
-                    when_step.expected_result = ZephyrOptimizedParser._generate_default_result(clean_txt)
+                    when_step.expected_result = ZephyrOptimizedParser._resolve_when_default_result(
+                        clean_txt,
+                        config,
+                    )
                     zephyr_steps.append(when_step)
                     pending_when_steps.clear()
 
@@ -368,7 +436,10 @@ class ZephyrOptimizedParser:
                     # If next step is not another Then, finalize the When‑Then group
                     if next_step_type != "then":
                         ZephyrOptimizedParser._finalize_pending_when_steps(
-                            pending_when_steps, accumulated_then_results, zephyr_steps
+                            pending_when_steps,
+                            accumulated_then_results,
+                            zephyr_steps,
+                            config,
                         )
                         pending_when_steps.clear()
                         accumulated_then_results.clear()
@@ -376,9 +447,11 @@ class ZephyrOptimizedParser:
                     # Orphaned Then step (no preceding When)
                     orphaned_then_results.append(clean_txt)
 
+            i += 1
+
         # Finalize any remaining pending When steps
         ZephyrOptimizedParser._finalize_pending_when_steps(
-            pending_when_steps, accumulated_then_results, zephyr_steps
+            pending_when_steps, accumulated_then_results, zephyr_steps, config
         )
 
         # Handle any remaining orphaned Then steps
@@ -426,7 +499,8 @@ class ZephyrOptimizedParser:
     def _finalize_pending_when_steps(
         pending_when_steps: List[ZephyrTestStep],
         accumulated_then_results: List[str],
-        zephyr_steps: List[ZephyrTestStep]
+        zephyr_steps: List[ZephyrTestStep],
+        config: ZephyrParserConfig,
     ):
         """
         Finalize pending When steps with their Then results.  Distributes
@@ -440,7 +514,10 @@ class ZephyrOptimizedParser:
         if not accumulated_then_results:
             # No Then steps – add When steps with default results
             for when_step in pending_when_steps:
-                when_step.expected_result = "Action completed successfully"
+                when_step.expected_result = ZephyrOptimizedParser._resolve_when_default_result(
+                    when_step.step_action,
+                    config,
+                )
                 zephyr_steps.append(when_step)
         elif len(pending_when_steps) == 1:
             # Single When step with multiple Then results
@@ -452,6 +529,15 @@ class ZephyrOptimizedParser:
             ZephyrOptimizedParser._distribute_then_results(
                 pending_when_steps, accumulated_then_results, zephyr_steps
             )
+
+    @staticmethod
+    def _resolve_when_default_result(action_text: str, config: ZephyrParserConfig) -> str:
+        """
+        Resolve the default expected result for When steps without Then results.
+        """
+        if config.when_default_expected_result == "auto":
+            return ZephyrOptimizedParser._generate_default_result(action_text)
+        return config.when_default_expected_result
 
     @staticmethod
     def _distribute_then_results(
@@ -581,12 +667,13 @@ class ZephyrOptimizedParser:
         bg_val_set: Set[str],
         steps: List[Step],
         tags: List[str],
+        config: ZephyrParserConfig,
     ) -> ZephyrTestCase:
         """
         Build a ``ZephyrTestCase`` from a scenario or scenario outline instance.
         Handles the conversion of steps, tag parsing, and objective generation.
         """
-        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set)
+        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set, config)
         fr_id, ccd, ncd, labels = ZephyrOptimizedParser.parse_tags(tags)
         objective = ZephyrOptimizedParser.generate_objective(name, tags)
 
@@ -602,7 +689,7 @@ class ZephyrOptimizedParser:
         )
 
     def _convert_scenario(self, sc: ScenarioTemplate, bg_precondition: str, bg_val_set: Set[str]) -> ZephyrTestCase:
-        return self._build_zephyr_case(sc.name, bg_precondition, bg_val_set, sc.steps, sc.tags)
+        return self._build_zephyr_case(sc.name, bg_precondition, bg_val_set, sc.steps, sc.tags, self.config)
 
     def _convert_outline(self, tpl: ScenarioTemplate, bg_precondition: str, bg_val_set: Set[str]) -> List[ZephyrTestCase]:
         cases: List[ZephyrTestCase] = []
@@ -616,7 +703,7 @@ class ZephyrOptimizedParser:
                 )
                 full_name = f"{rendered.name}-{identifier}" if identifier else rendered.name
                 cases.append(
-                    self._build_zephyr_case(full_name, bg_precondition, bg_val_set, rendered.steps, tpl.tags)
+                    self._build_zephyr_case(full_name, bg_precondition, bg_val_set, rendered.steps, tpl.tags, self.config)
                 )
         return cases
 
@@ -647,6 +734,56 @@ class ZephyrOptimizedParser:
             else:
                 cases.append(self._convert_scenario(sc_tpl, bg_precondition, bg_val_set))
         return cases
+
+    def build_bdd_scripts_from_feature(self) -> List[Tuple[str, str]]:
+        """
+        Build per-scenario BDD scripts for Zephyr's "Test Script (BDD)" import.
+        Returns a list of (case_name, bdd_script) tuples.
+        """
+        feature = self.parse()
+        feature_name = getattr(feature, "name", "Feature")
+
+        bg_lines: List[str] = []
+        if feature.background and feature.background.steps:
+            bg_lines.append("  Background:")
+            for step in feature.background.steps:
+                bg_lines.extend(self.format_step_for_bdd(step))
+
+        scripts: List[Tuple[str, str]] = []
+        for _, sc_tpl in feature.scenarios.items():
+            if sc_tpl.examples:
+                for ex_block in sc_tpl.examples:
+                    for ctx in ex_block.as_contexts():
+                        rendered = sc_tpl.render(ctx)
+                        identifier = (
+                            ctx.get("case identifier")
+                            or ctx.get("case_identifier")
+                            or ctx.get("case_name_identifier")
+                        )
+                        full_name = f"{rendered.name}-{identifier}" if identifier else rendered.name
+                        scripts.append((full_name, self._render_bdd_script(
+                            feature_name,
+                            rendered,
+                            bg_lines,
+                        )))
+            else:
+                scripts.append((sc_tpl.name, self._render_bdd_script(
+                    feature_name,
+                    sc_tpl,
+                    bg_lines,
+                )))
+        return scripts
+
+    def _render_bdd_script(self, feature_name: str, scenario: ScenarioTemplate, bg_lines: List[str]) -> str:
+        lines: List[str] = [f"Feature: {feature_name}", ""]
+        if scenario.tags:
+            lines.append(" ".join(scenario.tags))
+        lines.append(f"  Scenario: {scenario.name}")
+        if bg_lines:
+            lines.extend(bg_lines)
+        for step in scenario.steps:
+            lines.extend(self.format_step_for_bdd(step))
+        return "\n".join(lines).rstrip()
 
     # ------------------------------------------------------------------
     #  CSV Export for Zephyr (RECOMMENDED FORMAT)
@@ -719,6 +856,25 @@ class ZephyrOptimizedParser:
                             'Priority': '',
                             'Labels': ''
                         })
+
+    @staticmethod
+    def write_testcases_to_zephyr_bdd_csv(scripts: List[Tuple[str, str]], outfile: str):
+        """
+        Export BDD scripts for Zephyr's "BDD - Gherkin Script" import format.
+        """
+        with open(outfile, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = [
+                "Name",
+                "Test Script (BDD)",
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for name, script in scripts:
+                writer.writerow({
+                    "Name": name,
+                    "Test Script (BDD)": script,
+                })
 
     # ------------------------------------------------------------------
     #  Excel Export (Alternative format, but CSV is preferred)
