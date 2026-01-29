@@ -67,6 +67,14 @@ class ZephyrTestCase:
     labels: str = ""                           # Test labels/categories
 
 
+@dataclass
+class ZephyrParserConfig:
+    """Configuration options for parsing and expected-result defaults."""
+    given_expected_result: str = "None"
+    given_inherit_then_results: bool = True
+    when_default_expected_result: str = "auto"
+
+
 # -----------------------------------------------------------------------------
 # Main parser class optimized for Zephyr
 # -----------------------------------------------------------------------------
@@ -83,9 +91,10 @@ class ZephyrOptimizedParser:
     docstring.
     """
 
-    def __init__(self, feature_dir: Path, feature_file: str):
+    def __init__(self, feature_dir: Path, feature_file: str, config: Optional[ZephyrParserConfig] = None):
         self.feature_dir = feature_dir
         self.feature_file = feature_file
+        self.config = config or ZephyrParserConfig()
         self.feature = FeatureParser(self.feature_dir, self.feature_file)
 
     # ------------------------------------------------------------------
@@ -278,15 +287,16 @@ class ZephyrOptimizedParser:
     def collect_zephyr_steps(
         steps: List[Step],
         bg_values: Set[str],
+        config: ZephyrParserConfig,
     ) -> List[ZephyrTestStep]:
         """
         Convert Gherkin steps to Zephyr test steps format.  This method
         traverses the list of steps and produces a corresponding sequence of
         ``ZephyrTestStep`` objects.  Given steps that are not part of the
-        background will have an expected result of ``"None"``, while When/Then
-        combinations are processed to pair actions with results.  Orphaned
-        Then steps (those not preceded by a When) are grouped into a single
-        validation step.
+        background default to ``config.given_expected_result`` and can inherit
+        immediate Then results when configured. When/Then combinations are
+        processed to pair actions with results, and orphaned Then steps (those
+        not preceded by a When) are grouped into a single validation step.
         """
         zephyr_steps: List[ZephyrTestStep] = []
         step_number = 0
@@ -294,19 +304,37 @@ class ZephyrOptimizedParser:
         accumulated_then_results: List[str] = []  # Collect multiple Then statements
         orphaned_then_results: List[str] = []  # Then steps without preceding When steps
 
-        for i, step in enumerate(steps):
+        effective_types: List[str] = []
+        last_primary_type = "given"
+        for step in steps:
+            stype = step.type.lower()
+            if stype in {"and", "but"}:
+                effective_types.append(last_primary_type)
+            elif stype in {"given", "when", "then"}:
+                last_primary_type = stype
+                effective_types.append(stype)
+            else:
+                effective_types.append(stype)
+
+        i = 0
+        while i < len(steps):
+            step = steps[i]
             txt = ZephyrOptimizedParser.format_step(step)
             clean_txt = ZephyrOptimizedParser.format_step_for_zephyr(step)
-            stype = step.type.lower()
-            next_step_type = steps[i + 1].type.lower() if i + 1 < len(steps) else None
+            stype = effective_types[i]
+            next_step_type = effective_types[i + 1] if i + 1 < len(steps) else None
 
             if stype == "given":
                 if txt in bg_values:
+                    i += 1
                     continue  # Skip background steps
 
                 # Finalize any pending When steps before processing Given
                 ZephyrOptimizedParser._finalize_pending_when_steps(
-                    pending_when_steps, accumulated_then_results, zephyr_steps
+                    pending_when_steps,
+                    accumulated_then_results,
+                    zephyr_steps,
+                    config,
                 )
                 pending_when_steps.clear()
                 accumulated_then_results.clear()
@@ -322,12 +350,25 @@ class ZephyrOptimizedParser:
                     zephyr_steps.append(validation_step)
                     orphaned_then_results.clear()
 
+                expected_result = config.given_expected_result
+                if config.given_inherit_then_results and next_step_type == "then":
+                    then_results: List[str] = []
+                    j = i + 1
+                    while j < len(steps) and effective_types[j] == "then":
+                        then_results.append(ZephyrOptimizedParser.format_step_for_zephyr(steps[j]))
+                        j += 1
+                    expected_result = (
+                        ZephyrOptimizedParser._format_separated_verification(then_results)
+                        if then_results
+                        else config.given_expected_result
+                    )
+                    i = j - 1
+
                 step_number += 1
-                # For Given steps in a scenario, the expected result is simply 'None'
                 zephyr_steps.append(ZephyrTestStep(
                     step_number=step_number,
                     step_action=clean_txt,
-                    expected_result="None"
+                    expected_result=expected_result
                 ))
 
             elif stype == "when":
@@ -353,7 +394,10 @@ class ZephyrOptimizedParser:
 
                 # If next step is not Then and not another When, finalize with default result
                 if next_step_type not in ["then", "when"]:
-                    when_step.expected_result = ZephyrOptimizedParser._generate_default_result(clean_txt)
+                    when_step.expected_result = ZephyrOptimizedParser._resolve_when_default_result(
+                        clean_txt,
+                        config,
+                    )
                     zephyr_steps.append(when_step)
                     pending_when_steps.clear()
 
@@ -365,7 +409,10 @@ class ZephyrOptimizedParser:
                     # If next step is not another Then, finalize the When‑Then group
                     if next_step_type != "then":
                         ZephyrOptimizedParser._finalize_pending_when_steps(
-                            pending_when_steps, accumulated_then_results, zephyr_steps
+                            pending_when_steps,
+                            accumulated_then_results,
+                            zephyr_steps,
+                            config,
                         )
                         pending_when_steps.clear()
                         accumulated_then_results.clear()
@@ -373,9 +420,11 @@ class ZephyrOptimizedParser:
                     # Orphaned Then step (no preceding When)
                     orphaned_then_results.append(clean_txt)
 
+            i += 1
+
         # Finalize any remaining pending When steps
         ZephyrOptimizedParser._finalize_pending_when_steps(
-            pending_when_steps, accumulated_then_results, zephyr_steps
+            pending_when_steps, accumulated_then_results, zephyr_steps, config
         )
 
         # Handle any remaining orphaned Then steps
@@ -423,7 +472,8 @@ class ZephyrOptimizedParser:
     def _finalize_pending_when_steps(
         pending_when_steps: List[ZephyrTestStep],
         accumulated_then_results: List[str],
-        zephyr_steps: List[ZephyrTestStep]
+        zephyr_steps: List[ZephyrTestStep],
+        config: ZephyrParserConfig,
     ):
         """
         Finalize pending When steps with their Then results.  Distributes
@@ -437,7 +487,10 @@ class ZephyrOptimizedParser:
         if not accumulated_then_results:
             # No Then steps – add When steps with default results
             for when_step in pending_when_steps:
-                when_step.expected_result = "Action completed successfully"
+                when_step.expected_result = ZephyrOptimizedParser._resolve_when_default_result(
+                    when_step.step_action,
+                    config,
+                )
                 zephyr_steps.append(when_step)
         elif len(pending_when_steps) == 1:
             # Single When step with multiple Then results
@@ -449,6 +502,15 @@ class ZephyrOptimizedParser:
             ZephyrOptimizedParser._distribute_then_results(
                 pending_when_steps, accumulated_then_results, zephyr_steps
             )
+
+    @staticmethod
+    def _resolve_when_default_result(action_text: str, config: ZephyrParserConfig) -> str:
+        """
+        Resolve the default expected result for When steps without Then results.
+        """
+        if config.when_default_expected_result == "auto":
+            return ZephyrOptimizedParser._generate_default_result(action_text)
+        return config.when_default_expected_result
 
     @staticmethod
     def _distribute_then_results(
@@ -583,7 +645,7 @@ class ZephyrOptimizedParser:
         Build a ``ZephyrTestCase`` from a scenario or scenario outline instance.
         Handles the conversion of steps, tag parsing, and objective generation.
         """
-        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set)
+        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set, self.config)
         fr_id, ccd, ncd, labels = ZephyrOptimizedParser.parse_tags(tags)
         objective = ZephyrOptimizedParser.generate_objective(name, tags)
 
