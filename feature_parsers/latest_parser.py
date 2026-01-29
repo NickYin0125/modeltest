@@ -640,12 +640,13 @@ class ZephyrOptimizedParser:
         bg_val_set: Set[str],
         steps: List[Step],
         tags: List[str],
+        config: ZephyrParserConfig,
     ) -> ZephyrTestCase:
         """
         Build a ``ZephyrTestCase`` from a scenario or scenario outline instance.
         Handles the conversion of steps, tag parsing, and objective generation.
         """
-        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set, self.config)
+        zephyr_steps = ZephyrOptimizedParser.collect_zephyr_steps(steps, bg_val_set, config)
         fr_id, ccd, ncd, labels = ZephyrOptimizedParser.parse_tags(tags)
         objective = ZephyrOptimizedParser.generate_objective(name, tags)
 
@@ -661,7 +662,7 @@ class ZephyrOptimizedParser:
         )
 
     def _convert_scenario(self, sc: ScenarioTemplate, bg_precondition: str, bg_val_set: Set[str]) -> ZephyrTestCase:
-        return self._build_zephyr_case(sc.name, bg_precondition, bg_val_set, sc.steps, sc.tags)
+        return self._build_zephyr_case(sc.name, bg_precondition, bg_val_set, sc.steps, sc.tags, self.config)
 
     def _convert_outline(self, tpl: ScenarioTemplate, bg_precondition: str, bg_val_set: Set[str]) -> List[ZephyrTestCase]:
         cases: List[ZephyrTestCase] = []
@@ -675,7 +676,7 @@ class ZephyrOptimizedParser:
                 )
                 full_name = f"{rendered.name}-{identifier}" if identifier else rendered.name
                 cases.append(
-                    self._build_zephyr_case(full_name, bg_precondition, bg_val_set, rendered.steps, tpl.tags)
+                    self._build_zephyr_case(full_name, bg_precondition, bg_val_set, rendered.steps, tpl.tags, self.config)
                 )
         return cases
 
@@ -918,10 +919,10 @@ if __name__ == '__main__':
     zephyr_cases = parser.build_zephyr_testcases_from_feature()
 
     # Export in CSV format (RECOMMENDED for Zephyr import)
-    parser.write_testcases_to_zephyr_csv(zephyr_cases, "zephyr_test_cases11.csv")
+    parser.write_testcases_to_zephyr_csv(zephyr_cases, "zephyr_test_cases15.csv")
 
     # Export in Excel format (alternative)
-    parser.write_testcases_to_zephyr_excel(zephyr_cases, "zephyr_test_cases11.xlsx")
+    parser.write_testcases_to_zephyr_excel(zephyr_cases, "zephyr_test_cases15.xlsx")
 
     # Generate comparison report
     parser.generate_format_comparison_report("zephyr_optimization_report.txt")
