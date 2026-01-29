@@ -148,10 +148,9 @@ class ZephyrOptimizedParser:
            minimums and maximums.
         2. All rows are padded so that separators align consistently
            throughout the table.
-        3. A special header separator line uses a ``#-------#`` style
-           delimiter between the header and the rest of the rows instead of
-           the standard ``|`` separator.  This addresses the user's
-           requirement to visually distinguish the header.
+        3. A special header separator line uses standard pipe (``|``)
+           delimiters with dash fillers to keep the table readable in
+           Excel/Zephyr imports while still visually separating the header.
         4. Data rows continue to use the conventional pipe (``|``) delimiters
            with consistent spacing around cell contents.
         """
@@ -245,11 +244,9 @@ class ZephyrOptimizedParser:
 
             # Insert a header separator after the first row when there are more rows
             if row_idx == 0 and len(table_data) > 1:
-                # Build a '#-------#' style separator: a hash, then dashes sized to each column,
-                # separated by hash characters, and ending with a trailing hash.  No spaces are
-                # included to emphasise the header split.
+                # Build a pipe-based separator row so Excel/Zephyr render it cleanly.
                 dash_segments = ["-" * len(formatted_cells[col_idx]) for col_idx in range(len(formatted_cells))]
-                header_sep = "#" + "#".join(dash_segments) + "#"
+                header_sep = "| " + " | ".join(dash_segments) + " |"
                 table_lines.append(header_sep)
 
         return table_lines
